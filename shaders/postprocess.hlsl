@@ -4,6 +4,7 @@ Texture2D<float4> gInputTex0 : register(t0);
 Texture2D<float4> gInputTex1 : register(t1);
 Texture2D<float4> gInputTex2 : register(t2);
 Texture2D<float>  gDepthTex  : register(t3);
+Texture2D<float4> gDofTex    : register(t4);
 
 SamplerState gLinearClamp : register(s0);
 
@@ -146,12 +147,22 @@ float4 PSFinalComposite(VSOut i) : SV_TARGET {
     float2 toCenter = uv - 0.5;
     float r2 = dot(toCenter, toCenter);
 
-    // Very subtle optical radial chromatic aberration near frame corners
+    // Very subtle optical radial chromatic aberration near frame corners (sharp full-res HDR)
     float2 caShift = toCenter * (r2 * 0.0042);
-    float3 hdrCol;
-    hdrCol.r = gInputTex0.SampleLevel(gLinearClamp, saturate(uv + caShift), 0).r;
-    hdrCol.g = gInputTex0.SampleLevel(gLinearClamp, uv, 0).g;
-    hdrCol.b = gInputTex0.SampleLevel(gLinearClamp, saturate(uv - caShift), 0).b;
+    float3 sharpCol;
+    sharpCol.r = gInputTex0.SampleLevel(gLinearClamp, saturate(uv + caShift), 0).r;
+    sharpCol.g = gInputTex0.SampleLevel(gLinearClamp, uv, 0).g;
+    sharpCol.b = gInputTex0.SampleLevel(gLinearClamp, saturate(uv - caShift), 0).b;
+
+    // Seamlessly composite half-res creamy bokeh blur onto out-of-focus regions while keeping subject razor-sharp!
+    float3 hdrCol = sharpCol;
+    if (gDofParams.w >= 0.5) {
+        float depth = gDepthTex.SampleLevel(gLinearClamp, uv, 0);
+        float absCoC = abs(computeCoC(depth));
+        float dofBlend = smoothstep(0.45, 2.4, absCoC);
+        float3 bokehCol = gDofTex.SampleLevel(gLinearClamp, uv, 0).rgb;
+        hdrCol = lerp(sharpCol, bokehCol, dofBlend);
+    }
 
     // Add volumetric god rays & HDR bloom
     float3 volumetric = gInputTex1.SampleLevel(gLinearClamp, uv, 0).rgb;

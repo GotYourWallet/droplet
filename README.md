@@ -26,13 +26,13 @@ Zero external textures, models, or third-party libraries are required — all ge
 
 ## Verified Performance (2560×1440)
 
-Measured on **AMD Radeon RX 5700 XT** at native **2560×1440** (all effects enabled: tessellation, compute water/caustics, volumetric god rays, bokeh DoF, HDR bloom, FXAA):
+Measured on **AMD Radeon RX 5700 XT** at native **2560×1440** with full per-frame GPU synchronization (`--frames` benchmark mode; live interactive flip-model rendering with GPU pipelining runs even faster):
 
-| Camera Preset | Resolution | Avg FPS | Frame Time |
+| Camera Preset | Resolution | Avg FPS (GPU-Synced) | Frame Time |
 | :--- | :---: | :---: | :---: |
-| Preset 1 — Hero Branch & Droplet | 2560×1440 | **453.8 FPS** | 2.20 ms |
-| Preset 2 — Macro Droplet Close-Up | 2560×1440 | **374.1 FPS** | 2.67 ms |
-| Preset 3 — Pool Ripples & Caustics | 2560×1440 | **675.7 FPS** | 1.48 ms |
+| Preset 1 — Hero Branch & Droplet | 2560×1440 | **76.7 FPS** | 13.03 ms |
+| Preset 2 — Macro Droplet Close-Up | 2560×1440 | **77.2 FPS** | 12.95 ms |
+| Preset 3 — Pool Ripples & Caustics | 2560×1440 | **63.9 FPS** | 15.65 ms |
 
 ---
 
@@ -91,6 +91,7 @@ droplet/
 ├── src/
 │   ├── main.cpp               # Win32 window, input, droplet lifecycle & benchmark CLI
 │   ├── renderer.h / .cpp      # Full DirectX 11 multi-pass rendering pipeline
+│   ├── grass_texture.h        # Seamless 1024x1024 procedural PBR woodland grass textures
 │   ├── geometry.h             # Procedural branches, leaves, icosphere, pool bed & trunks
 │   └── math_utils.h           # Vector/matrix math, noise & camera helpers
 └── shaders/
@@ -100,6 +101,7 @@ droplet/
     ├── leaf.hlsl              # Backlit subsurface-scattering emerald leaves
     ├── water_sim.hlsl         # Compute shader 2D wave simulation & caustic map generation
     ├── pool.hlsl              # Caustic-lit pebbled pool bed & refractive water surface
+    ├── foliage.hlsl           # GPU-instanced 3D wind-swaying grass blades & pinnate ferns
     ├── particles.hlsl         # Floating golden-hour woodland dust motes
     ├── sky_volumetric.hlsl    # Atmospheric forest sky & raymarched volumetric god rays
     └── postprocess.hlsl       # Bokeh DoF, HDR Bloom, ACES Tonemapping & FXAA

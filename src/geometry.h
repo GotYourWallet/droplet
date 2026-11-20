@@ -367,20 +367,20 @@ inline MeshData buildIcosphereMesh(int subdivisions = 2) {
     return mesh;
 }
 
+inline float evalTerrainHeight(float x, float z) {
+    float r = std::sqrt(x * x + z * z);
+    float basin = -0.68f + 0.52f * smoothstep(0.8f, 3.6f, r) + 0.35f * smoothstep(3.5f, 7.2f, r);
+    float organic = (fbm2D(x * 0.55f + 4.1f, z * 0.55f - 2.3f) - 0.5f) * 0.28f;
+    float pebbles = (fbm2D(x * 2.8f - 1.7f, z * 2.8f + 5.9f) - 0.5f) * 0.065f;
+    float bankMounds = smoothstep(1.9f, 4.2f, r) * (fbm2D(x * 0.9f, z * 0.9f) * 0.24f);
+    return basin + organic + pebbles + bankMounds;
+}
+
 // Organic woodland pool basin & mossy riverbank (pure multi-octave noise, zero periodic stripes)
 inline MeshData buildPoolBedMesh() {
     MeshData mesh;
     const int N = 112;
     const float halfSize = 7.5f;
-
-    auto bedHeight = [](float x, float z) -> float {
-        float r = std::sqrt(x * x + z * z);
-        float basin = -0.68f + 0.52f * smoothstep(0.8f, 3.6f, r) + 0.35f * smoothstep(3.5f, 7.2f, r);
-        float organic = (fbm2D(x * 0.55f + 4.1f, z * 0.55f - 2.3f) - 0.5f) * 0.28f;
-        float pebbles = (fbm2D(x * 2.8f - 1.7f, z * 2.8f + 5.9f) - 0.5f) * 0.065f;
-        float bankMounds = smoothstep(1.9f, 4.2f, r) * (fbm2D(x * 0.9f, z * 0.9f) * 0.24f);
-        return basin + organic + pebbles + bankMounds;
-    };
 
     mesh.vertices.reserve((N + 1) * (N + 1));
     for (int iz = 0; iz <= N; ++iz) {
@@ -389,11 +389,11 @@ inline MeshData buildPoolBedMesh() {
             float fz = static_cast<float>(iz) / static_cast<float>(N);
             float x = (fx * 2.0f - 1.0f) * halfSize;
             float z = (fz * 2.0f - 1.0f) * halfSize;
-            float y = bedHeight(x, z);
+            float y = evalTerrainHeight(x, z);
 
             float eps = 0.06f;
-            float hx = bedHeight(x + eps, z) - bedHeight(x - eps, z);
-            float hz = bedHeight(x, z + eps) - bedHeight(x, z - eps);
+            float hx = evalTerrainHeight(x + eps, z) - evalTerrainHeight(x - eps, z);
+            float hz = evalTerrainHeight(x, z + eps) - evalTerrainHeight(x, z - eps);
             Vec3 n = normalize(Vec3(-hx, 2.0f * eps, -hz));
 
             float waterDepth = std::max(0.0f, POOL_WATER_Y - y);
@@ -512,6 +512,253 @@ inline std::vector<DustParticle> buildDustParticles(int count = 140) {
         );
         p.phase = hash11(fi * 13.3f) * TWO_PI;
         out.push_back(p);
+    }
+    return out;
+}
+
+// =============================================================================
+// Modern GPU-Instanced Crysis / Far Cry Ground Foliage (Alpha-Free 3D Geometry)
+// =============================================================================
+struct FoliageInstance {
+    Vec3  pos;
+    float height;
+    float yaw;
+    float lean;
+    float width;
+    float tintSeed;
+};
+
+// Tapered 4-segment 3D grass blade template (9 vertices, 7 triangles, zero alpha-test overdraw)
+inline MeshData buildGrassBladeMesh() {
+    MeshData mesh;
+    const int segs = 4;
+    for (int i = 0; i < segs; ++i) {
+        float t = static_cast<float>(i) / static_cast<float>(segs);
+        float halfW = (1.0f - t * t * 0.72f) * 0.5f;
+        Vertex vL, vR;
+        vL.pos = Vec3(-halfW, t, 0.0f);
+        vL.normal = Vec3(0.0f, 0.0f, -1.0f);
+        vL.tangent = Vec3(1.0f, 0.0f, 0.0f);
+        vL.uv = Vec2(0.0f, t);
+        vL.extra = Vec4(0.0f, t, 0.0f, 0.0f);
+
+        vR.pos = Vec3( halfW, t, 0.0f);
+        vR.normal = Vec3(0.0f, 0.0f, -1.0f);
+        vR.tangent = Vec3(1.0f, 0.0f, 0.0f);
+        vR.uv = Vec2(1.0f, t);
+        vR.extra = Vec4(0.0f, t, 0.0f, 0.0f);
+
+        mesh.vertices.push_back(vL);
+        mesh.vertices.push_back(vR);
+    }
+    // Sharp tip vertex
+    Vertex tip;
+    tip.pos = Vec3(0.0f, 1.0f, 0.0f);
+    tip.normal = Vec3(0.0f, 0.0f, -1.0f);
+    tip.tangent = Vec3(1.0f, 0.0f, 0.0f);
+    tip.uv = Vec2(0.5f, 1.0f);
+    tip.extra = Vec4(0.0f, 1.0f, 0.0f, 0.0f);
+    uint32_t tipIdx = static_cast<uint32_t>(mesh.vertices.size());
+    mesh.vertices.push_back(tip);
+
+    for (int i = 0; i < segs - 1; ++i) {
+        uint32_t a = i * 2;
+        uint32_t b = a + 1;
+        uint32_t c = a + 2;
+        uint32_t d = a + 3;
+        mesh.indices.push_back(a); mesh.indices.push_back(c); mesh.indices.push_back(b);
+        mesh.indices.push_back(b); mesh.indices.push_back(c); mesh.indices.push_back(d);
+    }
+    uint32_t topL = (segs - 1) * 2;
+    uint32_t topR = topL + 1;
+    mesh.indices.push_back(topL); mesh.indices.push_back(tipIdx); mesh.indices.push_back(topR);
+    return mesh;
+}
+
+// True 3D Crysis/Far Cry Pinnate Sword-Fern Frond (central rachis stem + 12 pairs of 3D tapered leaflets)
+inline MeshData buildFernFrondMesh() {
+    MeshData mesh;
+    auto pushTri = [&](const Vertex& a, const Vertex& b, const Vertex& c) {
+        uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
+        mesh.vertices.push_back(a);
+        mesh.vertices.push_back(b);
+        mesh.vertices.push_back(c);
+        mesh.indices.push_back(base);
+        mesh.indices.push_back(base + 1);
+        mesh.indices.push_back(base + 2);
+    };
+
+    auto makeV = [](Vec3 p, Vec3 n, Vec2 uv, float isStem) {
+        Vertex v;
+        v.pos = p;
+        v.normal = normalize(n);
+        v.tangent = Vec3(1.0f, 0.0f, 0.0f);
+        v.uv = uv;
+        v.extra = Vec4(isStem, uv.y, 0.0f, 0.0f);
+        return v;
+    };
+
+    // 1) Central rachis stem (tapered ribbon along +Z from 0.0 to 0.96)
+    const int stemSegs = 8;
+    for (int i = 0; i < stemSegs; ++i) {
+        float t0 = static_cast<float>(i) / stemSegs * 0.96f;
+        float t1 = static_cast<float>(i + 1) / stemSegs * 0.96f;
+        float w0 = lerp(0.016f, 0.004f, t0);
+        float w1 = lerp(0.016f, 0.004f, t1);
+        Vertex a = makeV(Vec3(-w0, 0.0f, t0), Vec3(0, 1, 0), Vec2(0.0f, t0), 1.0f);
+        Vertex b = makeV(Vec3( w0, 0.0f, t0), Vec3(0, 1, 0), Vec2(1.0f, t0), 1.0f);
+        Vertex c = makeV(Vec3(-w1, 0.0f, t1), Vec3(0, 1, 0), Vec2(0.0f, t1), 1.0f);
+        Vertex d = makeV(Vec3( w1, 0.0f, t1), Vec3(0, 1, 0), Vec2(1.0f, t1), 1.0f);
+        pushTri(a, c, b);
+        pushTri(b, c, d);
+    }
+
+    // 2) 12 pairs of opposite 3D tapered pinnate leaflets (pinnae) sweeping gently forward & upward
+    const int pairs = 12;
+    for (int p = 0; p < pairs; ++p) {
+        float frac = static_cast<float>(p) / static_cast<float>(pairs - 1);
+        float zBase = lerp(0.11f, 0.90f, frac);
+        // Natural sword-fern silhouette envelope: narrow near base, widest at 35%, tapering to tip
+        float env = std::sin(std::pow(frac, 0.72f) * PI) * 0.92f + 0.08f;
+        float pinnaLen = 0.24f * env;
+        float pinnaW   = lerp(0.030f, 0.016f, frac) * (0.65f + 0.35f * env);
+        float fwdSweep = 0.045f + 0.035f * frac;
+
+        for (int side = -1; side <= 1; side += 2) {
+            float sx = static_cast<float>(side);
+            // Mid-leaflet & tip positions with gentle V-cupping upward (+Y)
+            Vec3 pBase0(sx * 0.006f, 0.0f, zBase - pinnaW * 0.65f);
+            Vec3 pBase1(sx * 0.006f, 0.0f, zBase + pinnaW * 0.65f);
+            Vec3 pMid0 (sx * (pinnaLen * 0.54f), 0.018f * env, zBase + fwdSweep * 0.45f - pinnaW * 0.52f);
+            Vec3 pMid1 (sx * (pinnaLen * 0.54f), 0.018f * env, zBase + fwdSweep * 0.45f + pinnaW * 0.52f);
+            Vec3 pTip  (sx * pinnaLen, 0.006f * env, zBase + fwdSweep);
+
+            Vec3 nLeaf = normalize(Vec3(-sx * 0.24f, 1.0f, -0.10f));
+            Vertex vb0 = makeV(pBase0, nLeaf, Vec2(0.0f, zBase), 0.0f);
+            Vertex vb1 = makeV(pBase1, nLeaf, Vec2(0.0f, zBase), 0.0f);
+            Vertex vm0 = makeV(pMid0,  nLeaf, Vec2(0.55f, zBase), 0.0f);
+            Vertex vm1 = makeV(pMid1,  nLeaf, Vec2(0.55f, zBase), 0.0f);
+            Vertex vt  = makeV(pTip,   nLeaf, Vec2(1.0f, zBase), 0.0f);
+
+            if (side > 0) {
+                pushTri(vb0, vb1, vm0);
+                pushTri(vb1, vm1, vm0);
+                pushTri(vm0, vm1, vt);
+            } else {
+                pushTri(vb0, vm0, vb1);
+                pushTri(vb1, vm0, vm1);
+                pushTri(vm0, vt,  vm1);
+            }
+        }
+    }
+
+    // 3) Terminal tip leaflet
+    Vertex tL = makeV(Vec3(-0.022f, 0.0f, 0.90f), Vec3(0, 1, 0), Vec2(0.0f, 0.92f), 0.0f);
+    Vertex tR = makeV(Vec3( 0.022f, 0.0f, 0.90f), Vec3(0, 1, 0), Vec2(1.0f, 0.92f), 0.0f);
+    Vertex tT = makeV(Vec3( 0.000f, -0.008f, 1.04f), Vec3(0, 1, 0), Vec2(0.5f, 1.0f), 0.0f);
+    pushTri(tL, tT, tR);
+
+    return mesh;
+}
+
+// Organic Crysis-style woodland meadow grass distribution (42,000+ GPU-instanced 3D blades)
+inline std::vector<FoliageInstance> buildGrassInstances(int targetCount = 42000) {
+    std::vector<FoliageInstance> out;
+    out.reserve(targetCount);
+
+    uint32_t rng = 0x9E3779B9u;
+    auto next01 = [&]() -> float {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        return (rng & 0x00FFFFFFu) / 16777216.0f;
+    };
+
+    int attempts = 0;
+    const int maxAttempts = targetCount * 4;
+    while (static_cast<int>(out.size()) < targetCount && attempts < maxAttempts) {
+        ++attempts;
+        // Bias density slightly richer near the visible pool bank & mid-ground forest floor
+        float u = next01();
+        float angle = next01() * TWO_PI;
+        float radius = lerp(2.15f, 7.35f, std::pow(u, 0.72f));
+        float x = std::cos(angle) * radius;
+        float z = std::sin(angle) * radius;
+        if (std::fabs(x) > 7.25f || std::fabs(z) > 7.25f) continue;
+
+        float y = evalTerrainHeight(x, z);
+        if (y < POOL_WATER_Y + 0.025f) continue;
+
+        // Organic clumping density modulation so grass forms natural woodland tufts & soft trails
+        float clumpN = fbm2D(x * 1.15f + 3.7f, z * 1.15f - 2.1f);
+        if (next01() > smoothstep(0.18f, 0.62f, clumpN) * 0.92f + 0.15f) continue;
+
+        float shoreFactor = smoothstep(2.15f, 3.25f, radius);
+        float heightVar = 0.55f + 0.85f * fbm2D(x * 0.75f - 5.1f, z * 0.75f + 1.4f);
+
+        FoliageInstance inst;
+        inst.pos = Vec3(x, y - 0.022f, z);
+        inst.height = lerp(0.10f, 0.36f, shoreFactor) * heightVar * (0.72f + 0.56f * next01());
+        inst.yaw = next01() * TWO_PI;
+        inst.lean = 0.22f + 0.44f * next01();
+        inst.width = 0.017f + 0.015f * next01();
+        inst.tintSeed = next01();
+        out.push_back(inst);
+    }
+    return out;
+}
+
+// Lush Crysis / Far Cry 3D Woodland Fern Clusters (130+ rosettes -> ~1,250 arching pinnate fronds)
+inline std::vector<FoliageInstance> buildFernInstances(int clusterCount = 135) {
+    std::vector<FoliageInstance> out;
+    out.reserve(clusterCount * 10);
+
+    uint32_t rng = 0xC2B2AE35u;
+    auto next01 = [&]() -> float {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        return (rng & 0x00FFFFFFu) / 16777216.0f;
+    };
+
+    int placed = 0;
+    int attempts = 0;
+    while (placed < clusterCount && attempts < clusterCount * 12) {
+        ++attempts;
+        float u = next01();
+        float angle = next01() * TWO_PI;
+        float radius = lerp(2.45f, 6.95f, std::pow(u, 0.78f));
+        float cx = std::cos(angle) * radius;
+        float cz = std::sin(angle) * radius;
+        if (std::fabs(cx) > 7.0f || std::fabs(cz) > 7.0f) continue;
+
+        // Keep direct camera sightline in front of the hero droplet/pool uncluttered while framing left/right/back!
+        if (cx > -1.35f && cx < 1.35f && cz > -3.4f && cz < 0.2f) continue;
+
+        float cy = evalTerrainHeight(cx, cz);
+        if (cy < POOL_WATER_Y + 0.06f) continue;
+
+        // Cluster ferns in natural damp woodland patches
+        float patchN = fbm2D(cx * 0.65f + 9.2f, cz * 0.65f - 4.4f);
+        if (next01() > smoothstep(0.26f, 0.68f, patchN) + 0.12f) continue;
+
+        float clusterScale = (0.48f + 0.52f * next01()) * lerp(0.75f, 1.18f, smoothstep(2.45f, 4.8f, radius));
+        int numFronds = 8 + static_cast<int>(next01() * 4.0f);
+        float baseYaw = next01() * TWO_PI;
+
+        for (int f = 0; f < numFronds; ++f) {
+            float ff = static_cast<float>(f) / static_cast<float>(numFronds);
+            bool innerRing = (f % 3 == 0);
+            float yaw = baseYaw + ff * TWO_PI + (next01() - 0.5f) * 0.35f;
+            float frondLen = clusterScale * (innerRing ? (0.72f + 0.22f * next01()) : (0.92f + 0.24f * next01()));
+            float pitch = innerRing ? (0.42f + 0.26f * next01()) : (0.08f + 0.24f * next01());
+
+            FoliageInstance inst;
+            inst.pos = Vec3(cx + (next01() - 0.5f) * 0.06f, cy - 0.025f, cz + (next01() - 0.5f) * 0.06f);
+            inst.height = frondLen;
+            inst.yaw = yaw;
+            inst.lean = pitch;
+            inst.width = frondLen * (0.88f + 0.24f * next01());
+            inst.tintSeed = next01();
+            out.push_back(inst);
+        }
+        ++placed;
     }
     return out;
 }

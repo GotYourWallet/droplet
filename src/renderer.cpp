@@ -1,4 +1,5 @@
 #include "renderer.h"
+#include "grass_texture.h"
 #include <d3dcompiler.h>
 #include <cstdio>
 #include <cmath>
@@ -86,6 +87,7 @@ bool Renderer::init(HWND hwnd, uint32_t width, uint32_t height, const std::wstri
     if (!createShaders(shaderDir)) return false;
     if (!createGeometry()) return false;
     if (!createWaterSimResources()) return false;
+    if (!createGrassTextures()) return false;
 
     m_frameCB    = createConstantBuffer<FrameCBData>(m_device.Get());
     m_dropletCB  = createConstantBuffer<DropletCBData>(m_device.Get());
@@ -101,6 +103,18 @@ bool Renderer::init(HWND hwnd, uint32_t width, uint32_t height, const std::wstri
 }
 
 bool Renderer::createDeviceAndSwapchain(HWND hwnd) {
+    // Check flip-model tearing support (eliminates windowed DWM copy overhead)
+    m_allowTearing = false;
+    {
+        ComPtr<IDXGIFactory5> factory5;
+        if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory5)))) {
+            BOOL allowTearing = FALSE;
+            if (SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing, sizeof(allowTearing)))) {
+                m_allowTearing = (allowTearing == TRUE);
+            }
+        }
+    }
+
     DXGI_SWAP_CHAIN_DESC sd = {};
     sd.BufferCount = 2;
     sd.BufferDesc.Width = m_width;
@@ -112,7 +126,8 @@ bool Renderer::createDeviceAndSwapchain(HWND hwnd) {
     sd.OutputWindow = hwnd;
     sd.SampleDesc.Count = 1;
     sd.Windowed = TRUE;
-    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.Flags = m_allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
 
     D3D_FEATURE_LEVEL flOut;
     D3D_FEATURE_LEVEL flReq = D3D_FEATURE_LEVEL_11_0;
@@ -122,6 +137,17 @@ bool Renderer::createDeviceAndSwapchain(HWND hwnd) {
         nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
         &flReq, 1, D3D11_SDK_VERSION,
         &sd, &m_swapchain, &m_device, &flOut, &m_ctx);
+
+    if (FAILED(hr)) {
+        // Fallback to legacy DISCARD swap effect if FLIP_DISCARD is unsupported
+        m_allowTearing = false;
+        sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+        sd.Flags = 0;
+        hr = D3D11CreateDeviceAndSwapChain(
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
+            &flReq, 1, D3D11_SDK_VERSION,
+            &sd, &m_swapchain, &m_device, &flOut, &m_ctx);
+    }
 
     if (FAILED(hr)) {
         // Fallback to WARP software rasterizer if running on a headless/no-GPU VM
@@ -134,6 +160,10 @@ bool Renderer::createDeviceAndSwapchain(HWND hwnd) {
             return false;
         }
     }
+
+    D3D11_QUERY_DESC qd = {};
+    qd.Query = D3D11_QUERY_EVENT;
+    m_device->CreateQuery(&qd, &m_gpuSyncQuery);
 
     // Query GPU adapter name
     ComPtr<IDXGIDevice> dxgiDev;
@@ -179,16 +209,16 @@ bool Renderer::createRenderTargets() {
         return true;
     };
 
+    // Half-res volumetric god rays & Bokeh Depth of Field buffers (4x faster at 1440p!)
+    m_volW = std::max(m_width / 2, 1u);
+    m_volH = std::max(m_height / 2, 1u);
+
     if (!createRT(m_width, m_height, DXGI_FORMAT_R16G16B16A16_FLOAT, m_hdrTex, m_hdrRTV, m_hdrSRV)) return false;
     if (!createRT(m_width, m_height, DXGI_FORMAT_R16G16B16A16_FLOAT, m_sceneCopyTex, m_dropletBackRTV, m_sceneCopySRV, false)) return false;
     if (!createRT(m_width, m_height, DXGI_FORMAT_R16G16B16A16_FLOAT, m_dropletBackTex, m_dropletBackRTV, m_dropletBackSRV)) return false;
-    if (!createRT(m_width, m_height, DXGI_FORMAT_R16G16B16A16_FLOAT, m_dofTex, m_dofRTV, m_dofSRV)) return false;
+    if (!createRT(m_volW,  m_volH,   DXGI_FORMAT_R16G16B16A16_FLOAT, m_dofTex, m_dofRTV, m_dofSRV)) return false;
     if (!createRT(m_width, m_height, DXGI_FORMAT_R8G8B8A8_UNORM,     m_ldrTex, m_ldrRTV, m_ldrSRV)) return false;
-
-    // Half-res volumetric god rays buffer
-    m_volW = std::max(m_width / 2, 1u);
-    m_volH = std::max(m_height / 2, 1u);
-    if (!createRT(m_volW, m_volH, DXGI_FORMAT_R16G16B16A16_FLOAT, m_volTex, m_volRTV, m_volSRV)) return false;
+    if (!createRT(m_volW,  m_volH,   DXGI_FORMAT_R16G16B16A16_FLOAT, m_volTex, m_volRTV, m_volSRV)) return false;
 
     // 5-level HDR Bloom pyramid
     uint32_t bw = std::max(m_width / 2, 1u);
@@ -264,7 +294,8 @@ void Renderer::resize(uint32_t width, uint32_t height) {
     m_height = height;
     m_ctx->OMSetRenderTargets(0, nullptr, nullptr);
     m_backbufferRTV.Reset();
-    m_swapchain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, 0);
+    UINT swapFlags = m_allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    m_swapchain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, swapFlags);
     createRenderTargets();
 }
 
@@ -338,6 +369,13 @@ bool Renderer::createStates() {
     sd.BorderColor[0] = sd.BorderColor[1] = sd.BorderColor[2] = sd.BorderColor[3] = 1.0f;
     m_device->CreateSamplerState(&sd, &m_sampShadowCmp);
 
+    D3D11_SAMPLER_DESC asd = {};
+    asd.Filter = D3D11_FILTER_ANISOTROPIC;
+    asd.MaxAnisotropy = 16;
+    asd.AddressU = asd.AddressV = asd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    asd.MaxLOD = D3D11_FLOAT32_MAX;
+    m_device->CreateSamplerState(&asd, &m_sampAnisoWrap);
+
     return true;
 }
 
@@ -404,6 +442,12 @@ bool Renderer::createShaders(const std::wstring& dir) {
     if (!loadVS(L"pool.hlsl", "VSPoolWater", m_vsPoolWater)) return false;
     if (!loadPS(L"pool.hlsl", "PSPoolWater", m_psPoolWater)) return false;
 
+    if (!loadVS(L"foliage.hlsl", "VSGrass",      m_vsGrass)) return false;
+    if (!loadPS(L"foliage.hlsl", "PSGrass",      m_psGrass)) return false;
+    if (!loadVS(L"foliage.hlsl", "VSFern",       m_vsFern)) return false;
+    if (!loadVS(L"foliage.hlsl", "VSFernShadow", m_vsFernShadow)) return false;
+    if (!loadPS(L"foliage.hlsl", "PSFern",       m_psFern)) return false;
+
     if (!loadVS(L"sky_volumetric.hlsl", "VSFullscreen", m_vsSkyFullscreen)) return false;
     if (!loadPS(L"sky_volumetric.hlsl", "PSSky",        m_psSky)) return false;
     if (!loadPS(L"sky_volumetric.hlsl", "PSVolumetric", m_psVolumetric)) return false;
@@ -450,6 +494,33 @@ bool Renderer::createGeometry() {
     m_dropletMesh   = uploadMesh(geo::buildIcosphereMesh(2));
     m_poolBedMesh   = uploadMesh(geo::buildPoolBedMesh());
     m_poolWaterMesh = uploadMesh(geo::buildPoolWaterMesh());
+    m_grassBladeMesh = uploadMesh(geo::buildGrassBladeMesh());
+    m_fernFrondMesh  = uploadMesh(geo::buildFernFrondMesh());
+
+    auto uploadStructuredInstances = [&](const std::vector<geo::FoliageInstance>& instances,
+                                         ComPtr<ID3D11Buffer>& outBuf,
+                                         ComPtr<ID3D11ShaderResourceView>& outSRV,
+                                         uint32_t& outCount) -> bool {
+        outCount = static_cast<uint32_t>(instances.size());
+        if (outCount == 0) return true;
+        D3D11_BUFFER_DESC ibd = {};
+        ibd.ByteWidth = static_cast<UINT>(instances.size() * sizeof(geo::FoliageInstance));
+        ibd.Usage = D3D11_USAGE_IMMUTABLE;
+        ibd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        ibd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+        ibd.StructureByteStride = sizeof(geo::FoliageInstance);
+        D3D11_SUBRESOURCE_DATA isd = {instances.data(), 0, 0};
+        if (FAILED(m_device->CreateBuffer(&ibd, &isd, &outBuf))) return false;
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
+        srvd.Format = DXGI_FORMAT_UNKNOWN;
+        srvd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+        srvd.Buffer.NumElements = outCount;
+        return SUCCEEDED(m_device->CreateShaderResourceView(outBuf.Get(), &srvd, &outSRV));
+    };
+
+    if (!uploadStructuredInstances(geo::buildGrassInstances(42000), m_grassInstBuf, m_grassInstSRV, m_grassInstCount)) return false;
+    if (!uploadStructuredInstances(geo::buildFernInstances(135),    m_fernInstBuf,  m_fernInstSRV,  m_fernInstCount))  return false;
 
     auto particles = geo::buildDustParticles(140);
     m_particleCount = static_cast<uint32_t>(particles.size());
@@ -501,6 +572,42 @@ bool Renderer::createWaterSimResources() {
     if (FAILED(m_device->CreateShaderResourceView(m_causticTex.Get(), nullptr, &m_causticSRV))) return false;
     if (FAILED(m_device->CreateUnorderedAccessView(m_causticTex.Get(), nullptr, &m_causticUAV))) return false;
 
+    return true;
+}
+
+bool Renderer::createGrassTextures() {
+    auto grass = texgen::generateWoodlandGrassTextures(1024);
+
+    auto uploadMipmapped = [&](const std::vector<uint8_t>& pixels,
+                               ComPtr<ID3D11Texture2D>& outTex,
+                               ComPtr<ID3D11ShaderResourceView>& outSRV) -> bool {
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = grass.size;
+        td.Height = grass.size;
+        td.MipLevels = 0; // Full mipmap chain
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+
+        if (FAILED(m_device->CreateTexture2D(&td, nullptr, &outTex))) return false;
+        m_ctx->UpdateSubresource(outTex.Get(), 0, nullptr, pixels.data(), grass.size * 4, 0);
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvd = {};
+        srvd.Format = td.Format;
+        srvd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvd.Texture2D.MipLevels = static_cast<UINT>(-1);
+        srvd.Texture2D.MostDetailedMip = 0;
+        if (FAILED(m_device->CreateShaderResourceView(outTex.Get(), &srvd, &outSRV))) return false;
+
+        m_ctx->GenerateMips(outSRV.Get());
+        return true;
+    };
+
+    if (!uploadMipmapped(grass.albedoRGBA, m_grassAlbedoTex, m_grassAlbedoSRV)) return false;
+    if (!uploadMipmapped(grass.normalRoughRGBA, m_grassNormalTex, m_grassNormalSRV)) return false;
     return true;
 }
 
@@ -780,9 +887,9 @@ void Renderer::renderFrame(
     m_ctx->DSSetConstantBuffers(0, 1, frameCBs);
     m_ctx->PSSetConstantBuffers(0, 1, frameCBs);
 
-    ID3D11SamplerState* samps[] = {m_sampLinearClamp.Get(), m_sampShadowCmp.Get()};
-    m_ctx->VSSetSamplers(0, 2, samps);
-    m_ctx->PSSetSamplers(0, 2, samps);
+    ID3D11SamplerState* samps[] = {m_sampLinearClamp.Get(), m_sampShadowCmp.Get(), m_sampAnisoWrap.Get()};
+    m_ctx->VSSetSamplers(0, 3, samps);
+    m_ctx->PSSetSamplers(0, 3, samps);
 
     // =========================================================================
     // PASS 1: 2048x2048 Directional Sun Shadow Map
@@ -813,6 +920,15 @@ void Renderer::renderFrame(
     m_ctx->IASetVertexBuffers(0, 1, m_leavesMesh.vb.GetAddressOf(), &stride, &offset);
     m_ctx->IASetIndexBuffer(m_leavesMesh.ib.Get(), DXGI_FORMAT_R32_UINT, 0);
     m_ctx->DrawIndexed(m_leavesMesh.indexCount, 0, 0);
+
+    // GPU-instanced 3D woodland ferns cast dappled shadows onto the grass & bank!
+    if (m_fernInstCount > 0) {
+        m_ctx->VSSetShader(m_vsFernShadow.Get(), nullptr, 0);
+        m_ctx->VSSetShaderResources(0, 1, m_fernInstSRV.GetAddressOf());
+        m_ctx->IASetVertexBuffers(0, 1, m_fernFrondMesh.vb.GetAddressOf(), &stride, &offset);
+        m_ctx->IASetIndexBuffer(m_fernFrondMesh.ib.Get(), DXGI_FORMAT_R32_UINT, 0);
+        m_ctx->DrawIndexedInstanced(m_fernFrondMesh.indexCount, m_fernInstCount, 0, 0, 0);
+    }
 
     // =========================================================================
     // PASS 2: Main HDR Scene (Sky + Background Forest + Tessellated Branch + Leaves + Pool Bed)
@@ -866,15 +982,42 @@ void Renderer::renderFrame(
     m_ctx->IASetIndexBuffer(m_leavesMesh.ib.Get(), DXGI_FORMAT_R32_UINT, 0);
     m_ctx->DrawIndexed(m_leavesMesh.indexCount, 0, 0);
 
-    // 2d) Mossy Forest Floor & Submerged Pool Bed (with Compute Underwater Caustics!)
+    // 2d) Mossy Forest Floor & Submerged Pool Bed (with Compute Underwater Caustics + PBR Grass Texture!)
     m_ctx->RSSetState(settings.wireframe ? m_rsWireframe.Get() : m_rsCullBack.Get());
     m_ctx->VSSetShader(m_vsPoolBed.Get(), nullptr, 0);
     m_ctx->PSSetShader(m_psPoolBed.Get(), nullptr, 0);
-    ID3D11ShaderResourceView* bedSRVs[] = {m_shadowSRV.Get(), m_waterNormalSRV.Get(), m_causticSRV.Get()};
-    m_ctx->PSSetShaderResources(0, 3, bedSRVs);
+    ID3D11ShaderResourceView* bedSRVs[] = {
+        m_shadowSRV.Get(), m_waterNormalSRV.Get(), m_causticSRV.Get(),
+        nullptr, m_grassAlbedoSRV.Get(), m_grassNormalSRV.Get()
+    };
+    m_ctx->PSSetShaderResources(0, 6, bedSRVs);
     m_ctx->IASetVertexBuffers(0, 1, m_poolBedMesh.vb.GetAddressOf(), &stride, &offset);
     m_ctx->IASetIndexBuffer(m_poolBedMesh.ib.Get(), DXGI_FORMAT_R32_UINT, 0);
     m_ctx->DrawIndexed(m_poolBedMesh.indexCount, 0, 0);
+
+    // 2e) Modern GPU-Instanced 3D Wind-Swaying Grass Blades (42,000 alpha-free curved blades)
+    if (m_grassInstCount > 0) {
+        m_ctx->RSSetState(settings.wireframe ? m_rsWireframe.Get() : m_rsCullNone.Get());
+        m_ctx->VSSetShader(m_vsGrass.Get(), nullptr, 0);
+        m_ctx->PSSetShader(m_psGrass.Get(), nullptr, 0);
+        m_ctx->VSSetShaderResources(0, 1, m_grassInstSRV.GetAddressOf());
+        m_ctx->PSSetShaderResources(1, 1, m_shadowSRV.GetAddressOf());
+        m_ctx->IASetVertexBuffers(0, 1, m_grassBladeMesh.vb.GetAddressOf(), &stride, &offset);
+        m_ctx->IASetIndexBuffer(m_grassBladeMesh.ib.Get(), DXGI_FORMAT_R32_UINT, 0);
+        m_ctx->DrawIndexedInstanced(m_grassBladeMesh.indexCount, m_grassInstCount, 0, 0, 0);
+    }
+
+    // 2f) Crysis / Far Cry GPU-Instanced 3D Pinnate Woodland Ferns (Backlit SSS + Wind Field)
+    if (m_fernInstCount > 0) {
+        m_ctx->RSSetState(settings.wireframe ? m_rsWireframe.Get() : m_rsCullNone.Get());
+        m_ctx->VSSetShader(m_vsFern.Get(), nullptr, 0);
+        m_ctx->PSSetShader(m_psFern.Get(), nullptr, 0);
+        m_ctx->VSSetShaderResources(0, 1, m_fernInstSRV.GetAddressOf());
+        m_ctx->PSSetShaderResources(1, 1, m_shadowSRV.GetAddressOf());
+        m_ctx->IASetVertexBuffers(0, 1, m_fernFrondMesh.vb.GetAddressOf(), &stride, &offset);
+        m_ctx->IASetIndexBuffer(m_fernFrondMesh.ib.Get(), DXGI_FORMAT_R32_UINT, 0);
+        m_ctx->DrawIndexedInstanced(m_fernFrondMesh.indexCount, m_fernInstCount, 0, 0, 0);
+    }
 
     // =========================================================================
     // PASS 3: Rippling Pool Water Surface (Refracting the Caustic-Lit Pool Bed)
@@ -932,10 +1075,10 @@ void Renderer::renderFrame(
     m_ctx->Draw(3, 0);
 
     // =========================================================================
-    // PASS 7: Cinematic Golden-Angle Spiral Bokeh Depth of Field
+    // PASS 7: Half-Resolution Cinematic Golden-Angle Spiral Bokeh Depth of Field
     // =========================================================================
     unbindAllSRVs(m_ctx.Get());
-    m_ctx->RSSetViewports(1, &fullVP);
+    m_ctx->RSSetViewports(1, &volVP);
     m_ctx->OMSetRenderTargets(1, m_dofRTV.GetAddressOf(), nullptr);
     m_ctx->VSSetShader(m_vsFullscreen.Get(), nullptr, 0);
     m_ctx->PSSetShader(m_psDof.Get(), nullptr, 0);
@@ -986,15 +1129,17 @@ void Renderer::renderFrame(
     }
 
     // =========================================================================
-    // PASS 9: Final HDR Composite + ACES Filmic Tone Mapping + Vignette -> LDR
+    // PASS 9: Final HDR Composite (Full-Res Sharp + Half-Res Bokeh) + ACES -> LDR
     // =========================================================================
     unbindAllSRVs(m_ctx.Get());
     m_ctx->RSSetViewports(1, &fullVP);
     m_ctx->OMSetBlendState(m_bsOpaque.Get(), nullptr, 0xFFFFFFFF);
     m_ctx->OMSetRenderTargets(1, m_ldrRTV.GetAddressOf(), nullptr);
     m_ctx->PSSetShader(m_psComposite.Get(), nullptr, 0);
-    ID3D11ShaderResourceView* compSRVs[] = {m_dofSRV.Get(), m_volSRV.Get(), m_bloomSRV[0].Get()};
-    m_ctx->PSSetShaderResources(0, 3, compSRVs);
+    ID3D11ShaderResourceView* compSRVs[] = {
+        m_hdrSRV.Get(), m_volSRV.Get(), m_bloomSRV[0].Get(), m_depthSRV.Get(), m_dofSRV.Get()
+    };
+    m_ctx->PSSetShaderResources(0, 5, compSRVs);
     m_ctx->Draw(3, 0);
 
     // =========================================================================
@@ -1012,7 +1157,20 @@ void Renderer::renderFrame(
 }
 
 void Renderer::present(bool vsync) {
-    m_swapchain->Present(vsync ? 1 : 0, 0);
+    UINT syncInterval = vsync ? 1 : 0;
+    UINT presentFlags = (!vsync && m_allowTearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
+    m_swapchain->Present(syncInterval, presentFlags);
+}
+
+void Renderer::waitForGPU() {
+    if (!m_gpuSyncQuery) {
+        m_ctx->Flush();
+        return;
+    }
+    m_ctx->End(m_gpuSyncQuery.Get());
+    while (m_ctx->GetData(m_gpuSyncQuery.Get(), nullptr, 0, 0) == S_FALSE) {
+        YieldProcessor();
+    }
 }
 
 bool Renderer::saveBackbufferBMP(const std::string& filename) {

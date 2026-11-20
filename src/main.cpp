@@ -288,6 +288,10 @@ int main(int argc, char** argv) {
         computeCamera(gApp.settings.cameraPreset, simTime, camPos, camTarget);
         gApp.renderer.renderFrame(camPos, camTarget, simTime, gApp.settings);
         gApp.renderer.present(gApp.vsync);
+        // In headless CLI benchmark/screenshot mode, wait for GPU completion so reported FPS is true GPU throughput
+        if (maxFrames > 0 || !screenshotPath.empty()) {
+            gApp.renderer.waitForGPU();
+        }
 
         ++totalFrames;
         fpsFrames++;
