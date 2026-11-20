@@ -3,7 +3,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d11.h>
-#include <dxgi.h>
+#include <dxgi1_5.h>
 #include <wrl/client.h>
 #include <string>
 #include <vector>
@@ -88,6 +88,7 @@ public:
         float totalTime,
         const DemoSettings& settings);
     void present(bool vsync);
+    void waitForGPU();
     bool saveBackbufferBMP(const std::string& filename);
 
     uint32_t width() const { return m_width; }
@@ -103,6 +104,7 @@ private:
     bool createShaders(const std::wstring& shaderDir);
     bool createGeometry();
     bool createWaterSimResources();
+    bool createGrassTextures();
 
     GpuMesh uploadMesh(const geo::MeshData& data);
     void stepWaterSimulation(float dt, float totalTime, bool triggerSplash, float splashStrength);
@@ -117,6 +119,8 @@ private:
     ComPtr<ID3D11DeviceContext> m_ctx;
     ComPtr<IDXGISwapChain> m_swapchain;
     ComPtr<ID3D11RenderTargetView> m_backbufferRTV;
+    ComPtr<ID3D11Query> m_gpuSyncQuery;
+    bool m_allowTearing = false;
 
     // Main HDR scene + depth + copies
     ComPtr<ID3D11Texture2D> m_hdrTex, m_sceneCopyTex, m_dropletBackTex, m_dofTex, m_ldrTex;
@@ -168,6 +172,8 @@ private:
     ComPtr<ID3D11PixelShader> m_psDropletBack, m_psDropletFront;
     ComPtr<ID3D11VertexShader> m_vsPoolBed, m_vsPoolWater;
     ComPtr<ID3D11PixelShader> m_psPoolBed, m_psPoolWater;
+    ComPtr<ID3D11VertexShader> m_vsGrass, m_vsFern, m_vsFernShadow;
+    ComPtr<ID3D11PixelShader> m_psGrass, m_psFern;
     ComPtr<ID3D11VertexShader> m_vsFullscreen, m_vsSkyFullscreen, m_vsParticles;
     ComPtr<ID3D11PixelShader> m_psSky, m_psVolumetric, m_psParticles;
     ComPtr<ID3D11PixelShader> m_psDof, m_psBloomPrefilter, m_psBloomDown, m_psBloomUp, m_psComposite, m_psFxaa;
@@ -180,10 +186,18 @@ private:
     ComPtr<ID3D11RasterizerState> m_rsCullBack, m_rsCullFront, m_rsCullNone, m_rsWireframe, m_rsShadow;
     ComPtr<ID3D11DepthStencilState> m_dssDefault, m_dssReadOnly, m_dssDisabled, m_dssSky;
     ComPtr<ID3D11BlendState> m_bsOpaque, m_bsAlpha, m_bsAdditive;
-    ComPtr<ID3D11SamplerState> m_sampLinearClamp, m_sampShadowCmp;
+    ComPtr<ID3D11SamplerState> m_sampLinearClamp, m_sampShadowCmp, m_sampAnisoWrap;
+
+    // Procedural 1024x1024 PBR Woodland Grass Floor Textures (Albedo+AO, Normal+Roughness)
+    ComPtr<ID3D11Texture2D> m_grassAlbedoTex, m_grassNormalTex;
+    ComPtr<ID3D11ShaderResourceView> m_grassAlbedoSRV, m_grassNormalSRV;
 
     // Geometry
     GpuMesh m_branchMesh, m_bgForestMesh, m_leavesMesh, m_dropletMesh, m_poolBedMesh, m_poolWaterMesh;
+    GpuMesh m_grassBladeMesh, m_fernFrondMesh;
+    ComPtr<ID3D11Buffer> m_grassInstBuf, m_fernInstBuf;
+    ComPtr<ID3D11ShaderResourceView> m_grassInstSRV, m_fernInstSRV;
+    uint32_t m_grassInstCount = 0, m_fernInstCount = 0;
     ComPtr<ID3D11Buffer> m_particleBuf;
     ComPtr<ID3D11ShaderResourceView> m_particleSRV;
     uint32_t m_particleCount = 0;

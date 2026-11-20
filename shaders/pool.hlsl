@@ -4,9 +4,12 @@ Texture2D<float>  gShadowMap      : register(t0);
 Texture2D<float4> gWaterNormalTex : register(t1); // rgb = normal, a = wave height
 Texture2D<float4> gCausticTex     : register(t2); // rgb = underwater compute caustics
 Texture2D<float4> gSceneColor     : register(t3); // pre-water HDR scene for refraction
+Texture2D<float4> gGrassAlbedoTex : register(t4); // rgb = linear woodland grass albedo, a = AO
+Texture2D<float4> gGrassNormalTex : register(t5); // rgb = tangent-space normal, a = roughness
 
 SamplerState gLinearClamp         : register(s0);
 SamplerComparisonState gShadowSamp: register(s1);
+SamplerState gAnisoWrap           : register(s2);
 
 struct VSIn {
     float3 pos     : POSITION;
@@ -36,7 +39,7 @@ PSIn VSPoolBed(VSIn i) {
 }
 
 float4 PSPoolBed(PSIn i) : SV_TARGET {
-    float3 N = normalize(i.normal);
+    float3 geomN = normalize(i.normal);
     float3 V = normalize(gCameraPosTime.xyz - i.worldPos);
     float3 L = normalize(gSunDirNear.xyz);
 
@@ -44,27 +47,64 @@ float4 PSPoolBed(PSIn i) : SV_TARGET {
     float radialDist = i.extra.y;
     float mossMask   = i.extra.z;
 
-    // Procedural river pebbles + wet loam + mossy forest bank
+    // Procedural river pebbles & wet silt for the submerged pool bed
     float pebbleN = ridgedFbm3D(i.worldPos * 4.8);
     float fineN   = fbm3D(i.worldPos * 14.0);
-    float mossN   = fbm3D(i.worldPos * 3.5 + float3(4.2, 0.0, 1.9));
 
-    float3 siltCol   = float3(0.045, 0.038, 0.028);
-    float3 stoneCol  = lerp(float3(0.11, 0.10, 0.085), float3(0.18, 0.16, 0.13), fineN);
+    float3 siltCol   = float3(0.042, 0.035, 0.025);
+    float3 stoneCol  = lerp(float3(0.10, 0.092, 0.078), float3(0.17, 0.15, 0.12), fineN);
     float3 bedAlbedo = lerp(siltCol, stoneCol, smoothstep(0.32, 0.72, pebbleN));
 
-    float3 mossCol = lerp(float3(0.035, 0.095, 0.024), float3(0.125, 0.225, 0.048), fineN);
-    float mossBlend = saturate(mossMask * smoothstep(0.28, 0.68, mossN));
-    float3 albedo = lerp(bedAlbedo, mossCol, mossBlend);
+    // Dual-scale anti-tiled 1024x1024 realistic woodland grass PBR texture (Albedo + Normal + AO + Roughness)
+    float2 uv1 = i.worldPos.xz * 0.65;
+    float2x2 rot37 = float2x2(0.7986, -0.6018, 0.6018, 0.7986);
+    float2 uv2 = mul(rot37, i.worldPos.xz) * 0.34 + float2(0.41, 0.73);
+    float macroVar = fbm3D(i.worldPos * 0.55 + float3(2.3, 0.0, 5.1));
+    float tileBlend = smoothstep(0.28, 0.72, macroVar);
 
-    // Wet shoreline darkening
-    float shorelineWet = smoothstep(0.35, -0.05, i.worldPos.y - gDripOriginPool.w);
-    albedo *= lerp(1.0, 0.55, shorelineWet);
-    float roughness = lerp(0.84, 0.28, shorelineWet * (1.0 - mossBlend * 0.6));
+    float4 gAlb1 = gGrassAlbedoTex.Sample(gAnisoWrap, uv1);
+    float4 gAlb2 = gGrassAlbedoTex.Sample(gAnisoWrap, uv2);
+    float4 gNrm1 = gGrassNormalTex.Sample(gAnisoWrap, uv1);
+    float4 gNrm2 = gGrassNormalTex.Sample(gAnisoWrap, uv2);
+
+    // Macro woodland color variation (lush emerald patches vs slightly warmer sunlit clover/moss)
+    float3 grassAlbedo = lerp(gAlb1.rgb, gAlb2.rgb, tileBlend * 0.55);
+    float3 tint = lerp(float3(0.84, 0.94, 0.80), float3(1.16, 1.10, 0.88), smoothstep(0.30, 0.75, macroVar));
+    grassAlbedo *= tint;
+
+    float grassAO    = lerp(gAlb1.a, gAlb2.a, tileBlend * 0.55);
+    float grassRough = lerp(gNrm1.a, gNrm2.a, tileBlend * 0.55);
+
+    // Reconstruct tangent-space grass blade normal and blend onto terrain geometry normal
+    float3 tsN1 = gNrm1.rgb * 2.0 - 1.0;
+    float3 tsN2 = gNrm2.rgb * 2.0 - 1.0;
+    // Rotate secondary normal back into primary XZ frame
+    float2 rotN2 = mul(transpose(rot37), tsN2.xy);
+    float3 tsN = normalize(lerp(tsN1, float3(rotN2, tsN2.z), tileBlend * 0.55));
+
+    float3 T = normalize(float3(1.0, 0.0, 0.0) - geomN * geomN.x);
+    float3 B = normalize(cross(geomN, T));
+    float3 grassWorldN = normalize(T * tsN.x + B * tsN.y + geomN * tsN.z);
+
+    // Smoothly transition from lush textured grass bank to wet shoreline stones & submerged pool bed
+    float grassBlend = saturate(mossMask * smoothstep(-0.02, 0.14, i.worldPos.y - gDripOriginPool.w));
+    float3 N = normalize(lerp(geomN, grassWorldN, grassBlend * 0.90));
+    float3 albedo = lerp(bedAlbedo, grassAlbedo, grassBlend);
+    float ao = lerp(0.82, lerp(0.50, 1.0, grassAO), grassBlend);
+
+    // Wet shoreline darkening & specular gloss near the water's edge
+    float shorelineWet = smoothstep(0.32, -0.04, i.worldPos.y - gDripOriginPool.w);
+    albedo *= lerp(1.0, 0.52, shorelineWet);
+    float roughness = lerp(0.84, grassRough, grassBlend);
+    roughness = lerp(roughness, 0.24, shorelineWet * (1.0 - grassBlend * 0.55));
 
     float shadow = sampleShadowPCF(gShadowMap, gShadowSamp, i.worldPos, N);
     float3 direct = evalPBRDirect(N, V, L, albedo, roughness, 0.0, gSunColorFar.xyz) * shadow;
-    float3 ambient = evalIBLAmbient(N, V, albedo, roughness, 0.0, 0.8);
+    float3 ambient = evalIBLAmbient(N, V, albedo, roughness, 0.0, ao);
+
+    // Golden-hour backlit velvety sheen along grass blade tips
+    float grassRim = pow(1.0 - saturate(dot(geomN, V)), 2.8) * grassBlend * saturate(dot(-V, L) * 0.55 + 0.45);
+    float3 grassSheen = float3(0.24, 0.38, 0.09) * gSunColorFar.xyz * (grassRim * grassAO * 0.22 * lerp(0.35, 1.0, shadow));
 
     // Compute-generated underwater caustics projected onto the submerged pool bed (soft 5-tap filter)
     float3 caustics = 0.0;
@@ -84,7 +124,7 @@ float4 PSPoolBed(PSIn i) : SV_TARGET {
     // Analytical lens caustic focused by the hanging/falling droplet above
     float3 dropCaustic = evalDropletLensCaustic(i.worldPos, N, gHeroDropCaustic.xyz, gHeroDropCaustic.w, L, gSunColorFar.xyz);
 
-    float3 color = direct + ambient + caustics + dropCaustic * 0.45;
+    float3 color = direct + ambient + grassSheen + caustics + dropCaustic * 0.45;
 
     // Gentle woodland mist
     float dist = length(i.worldPos - gCameraPosTime.xyz);
